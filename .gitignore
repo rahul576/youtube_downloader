@@ -1,0 +1,7 @@
+# Build output
+Video Saver.app/
+build.log
+*.bak
+
+# macOS
+.DS_Store

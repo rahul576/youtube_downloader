@@ -2,6 +2,7 @@
 # Builds "Video Saver.app" from source on your Mac.
 #   bash build.sh            -> builds the app in this folder
 #   bash build.sh --install  -> also copies it into /Applications
+#   bash build.sh --dist     -> builds a universal (Apple Silicon + Intel) app and zips it into dist/
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -39,11 +40,19 @@ echo "==> Compiling"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-ARCH="$(uname -m)"   # arm64 on Apple Silicon, x86_64 on Intel
-xcrun swiftc -O -parse-as-library -sdk "$(xcrun --show-sdk-path)" \
-  -target "$ARCH-apple-macos13.0" \
-  Sources/*.swift \
-  -o "$APP/Contents/MacOS/$EXE"
+SDK="$(xcrun --show-sdk-path)"
+compile() {   # $1 = arm64 | x86_64, $2 = output binary
+  xcrun swiftc -O -parse-as-library -sdk "$SDK" -target "$1-apple-macos13.0" Sources/*.swift -o "$2"
+}
+if [ "${1:-}" = "--dist" ]; then
+  TMP="$(mktemp -d)"
+  compile arm64  "$TMP/arm64"
+  compile x86_64 "$TMP/x86_64"
+  lipo -create "$TMP/arm64" "$TMP/x86_64" -output "$APP/Contents/MacOS/$EXE"
+  rm -rf "$TMP"
+else
+  compile "$(uname -m)" "$APP/Contents/MacOS/$EXE"   # arm64 on Apple Silicon, x86_64 on Intel
+fi
 
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
@@ -51,7 +60,14 @@ cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 echo "==> Signing (ad-hoc, for this Mac)"
 codesign --force --deep --sign - "$APP" >/dev/null
 
-if [ "${1:-}" = "--install" ]; then
+if [ "${1:-}" = "--dist" ]; then
+  VERSION="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Resources/Info.plist)"
+  mkdir -p dist
+  ZIP="dist/VideoSaver-v$VERSION-macOS.zip"
+  rm -f "$ZIP"
+  ditto -c -k --keepParent "$APP" "$ZIP"
+  echo "Done — $ZIP ($(lipo -archs "$APP/Contents/MacOS/$EXE"))"
+elif [ "${1:-}" = "--install" ]; then
   echo "==> Installing to /Applications"
   rm -rf "/Applications/$APP"
   cp -R "$APP" /Applications/

@@ -5,3 +5,4 @@ build.log
 
 # macOS
 .DS_Store
+dist/

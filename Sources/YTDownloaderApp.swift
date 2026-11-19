@@ -9,15 +9,18 @@ struct YTDownloaderApp: App {
     var body: some Scene {
         WindowGroup("Video Saver") {
             ContentView()
-                .frame(minWidth: 620, minHeight: 560)
+                .frame(minWidth: 660, minHeight: 620)
         }
-        .defaultSize(width: 680, height: 800)
+        .defaultSize(width: 740, height: 900)
     }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationWillTerminate(_ notification: Notification) { Downloader.shared.terminateAll() }
 }
+
+let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "2.0"
 
 // MARK: - Palette
 
@@ -27,27 +30,52 @@ extension Color {
     static let vsPink   = Color(red: 0.96, green: 0.30, blue: 0.56)
     static let vsOrange = Color(red: 1.00, green: 0.56, blue: 0.27)
     static let vsTeal   = Color(red: 0.10, green: 0.72, blue: 0.66)
+    /// Dark green with enough contrast for white text on it, or as text on the light cards.
+    static let vsGreen  = Color(red: 0.02, green: 0.48, blue: 0.27)
+    static let vsRed    = Color(red: 0.82, green: 0.13, blue: 0.18)
+    static let vsAmber  = Color(red: 0.80, green: 0.40, blue: 0.00)
 }
 
 let brandGradient = LinearGradient(colors: [.vsIndigo, .vsViolet, .vsPink],
                                    startPoint: .leading, endPoint: .trailing)
 
+enum QueueFilter: String, CaseIterable, Identifiable {
+    case all = "All", waiting = "Waiting", active = "Downloading", saved = "Saved", failed = "Failed"
+    var id: String { rawValue }
+}
+
 /// Plain ObservableObject instead of @State (avoids needing SwiftUI macro plugins with Command Line Tools).
 final class FormState: ObservableObject {
-    @Published var showLog = false
+    @Published var showSettings = false
+    @Published var queueFilter: QueueFilter = .all
+    @Published var logFilter = 0          // 0 all, 1 saved, 2 failed
+}
+
+func formatSpeed(_ bps: Double) -> String {
+    guard bps > 0 else { return "—" }
+    let f = ByteCountFormatter()
+    f.countStyle = .file
+    f.allowedUnits = [.useKB, .useMB, .useGB]
+    return f.string(fromByteCount: Int64(bps)) + "/s"
+}
+
+func formatDisk(_ b: Int64) -> String {
+    let f = ByteCountFormatter()
+    f.countStyle = .file
+    f.allowedUnits = [.useGB, .useTB]
+    return f.string(fromByteCount: b)
 }
 
 // MARK: - Main view
 
 struct ContentView: View {
-    @StateObject private var dl = Downloader()
+    @StateObject private var dl = Downloader.shared
     @StateObject private var form = FormState()
 
     @AppStorage("folder") private var folder: String =
         FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first?.path ?? NSHomeDirectory()
     @AppStorage("mode") private var mode: Mode = .video
     @AppStorage("audioFormat") private var audioFormat = "MP3"
-    @AppStorage("cookiesBrowser") private var cookiesBrowser = ""
 
     private let audioFormats: [(String, String)] = [("MP3", "Plays anywhere"), ("M4A", "Apple / AAC"),
                                                     ("WAV", "Uncompressed"), ("FLAC", "Lossless")]
@@ -55,8 +83,8 @@ struct ContentView: View {
     private var trimmedURL: String { dl.url.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var urlLooksValid: Bool { trimmedURL.hasPrefix("http://") || trimmedURL.hasPrefix("https://") }
     private var playlistActive: Bool { dl.playlistMode && dl.showingPlaylist }
-    private var canDownload: Bool {
-        urlLooksValid && !dl.isRunning && !dl.fetching && (!playlistActive || dl.selectedCount > 0)
+    private var canAdd: Bool {
+        urlLooksValid && !dl.fetching && (!playlistActive || dl.selectedCount > 0)
     }
 
     var body: some View {
@@ -65,20 +93,38 @@ struct ContentView: View {
                            startPoint: .topLeading, endPoint: .bottomTrailing)
                 .ignoresSafeArea()
 
-            ScrollView {
-                VStack(spacing: 14) {
+            VStack(spacing: 0) {
+                // Pinned at the top: header + live progress.
+                VStack(spacing: 12) {
                     header
-                    if !dl.toolsMissing.isEmpty { missingToolsBanner }
-                    linkCard
-                    formatCard
-                    if playlistActive { playlistCard }
-                    signInCard
-                    folderCard
-                    actionCard
+                    if !dl.tasks.isEmpty { progressPanel }
                 }
-                .padding(20)
+                .padding(.horizontal, 20)
+                .padding(.top, 18)
+                .padding(.bottom, 12)
+
+                ScrollView {
+                    VStack(spacing: 14) {
+                        if !dl.toolsMissing.isEmpty { missingToolsBanner }
+                        if dl.needsSignIn { signInBanner }
+                        linkCard
+                        formatCard
+                        if playlistActive { playlistCard }
+                        folderCard
+                        addButton
+                        if !dl.tasks.isEmpty { queueCard }
+                        if !dl.entries.isEmpty { logCard }
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 20)
+                }
             }
         }
+        .sheet(isPresented: $form.showSettings) {
+            SettingsView(dl: dl) { form.showSettings = false }
+        }
+        .onAppear { dl.diskFolder = folder }
+        .onChange(of: folder) { newValue in dl.diskFolder = newValue }
     }
 
     // MARK: Header
@@ -86,30 +132,30 @@ struct ContentView: View {
     private var header: some View {
         HStack(spacing: 14) {
             Image(nsImage: NSApp.applicationIconImage)
-                .resizable().frame(width: 56, height: 56)
+                .resizable().frame(width: 52, height: 52)
                 .shadow(color: .black.opacity(0.25), radius: 6, y: 3)
             VStack(alignment: .leading, spacing: 2) {
-                Text("Video Saver")
-                    .font(.system(size: 28, weight: .heavy, design: .rounded))
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("Video Saver")
+                        .font(.system(size: 26, weight: .heavy, design: .rounded))
+                    Text("v\(appVersion)")
+                        .font(.system(size: 11, weight: .bold))
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Capsule().fill(Color.white.opacity(0.22)))
+                }
                 Text("Keep videos and music for offline")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.system(size: 12, weight: .medium))
                     .opacity(0.85)
             }
             .foregroundStyle(.white)
             Spacer()
-            Button { dl.updateYtDlp() } label: {
-                Label("Update engine", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 12).padding(.vertical, 7)
-                    .background(Capsule().fill(Color.white.opacity(0.18)))
-                    .overlay(Capsule().stroke(Color.white.opacity(0.35), lineWidth: 1))
-            }
-            .buttonStyle(.plain)
-            .disabled(dl.isRunning)
-            .help("Updates yt-dlp. YouTube changes often — do this if downloads start failing.")
+            DiskPill(free: dl.freeBytes, total: dl.totalBytes, low: dl.lowDisk, limitGB: dl.minFreeGB)
+            HeaderButton(title: dl.updatingEngine ? "Updating…" : "Update engine",
+                         icon: "arrow.triangle.2.circlepath") { dl.updateYtDlp() }
+                .disabled(dl.updatingEngine || dl.stats.active > 0)
+                .help("Updates yt-dlp. YouTube changes often, so do this if downloads start failing.")
+            HeaderButton(title: "Settings", icon: "gearshape.fill") { form.showSettings = true }
         }
-        .padding(.bottom, 4)
     }
 
     private var missingToolsBanner: some View {
@@ -119,8 +165,137 @@ struct ContentView: View {
             .foregroundStyle(.white)
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 12).fill(Color.orange.opacity(0.9)))
+            .background(RoundedRectangle(cornerRadius: 12).fill(Color.vsAmber))
             .textSelection(.enabled)
+    }
+
+    private var signInBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "person.badge.key.fill")
+            Text("YouTube asked to confirm you’re not a bot. Open Settings and choose the browser you’re signed in to YouTube with.")
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer()
+            Button("Open Settings") { form.showSettings = true }
+                .buttonStyle(.plain)
+                .font(.system(size: 12, weight: .bold))
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background(Capsule().fill(Color.white.opacity(0.25)))
+        }
+        .font(.system(size: 12, weight: .semibold))
+        .foregroundStyle(.white)
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.vsAmber))
+    }
+
+    // MARK: Progress panel (pinned)
+
+    private var progressHeadline: String {
+        let s = dl.stats
+        let progress = "\(s.finished) of \(s.total) done"
+        if s.active > 0 { return (dl.paused ? "Finishing current downloads · " : "Downloading · ") + progress }
+        if dl.paused && s.waiting > 0 { return "Paused · " + progress }
+        if s.waiting > 0 { return "Waiting to retry · " + progress }
+        return "Finished · " + progress
+    }
+
+    private var progressPanel: some View {
+        let s = dl.stats
+        let finishedAll = s.active == 0 && s.waiting == 0
+        return Card(nil, icon: nil, tint: .clear) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(progressHeadline)
+                    .font(.system(size: 14, weight: .bold))
+                Spacer()
+                if s.active > 0 {
+                    Label(formatSpeed(dl.totalSpeed), systemImage: "arrow.down.circle.fill")
+                        .font(.system(size: 13, weight: .bold).monospacedDigit())
+                        .foregroundStyle(Color.vsIndigo)
+                        .help("Total download speed across all \(s.active) running downloads")
+                }
+                if let eta = dl.etaText {
+                    Text(eta).font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
+                }
+                Text("\(Int(dl.overallProgress * 100))%")
+                    .font(.system(size: 13, weight: .heavy).monospacedDigit())
+            }
+            ProgressBar(value: dl.overallProgress, done: finishedAll && s.failed == 0 && s.done > 0, height: 14)
+
+            HStack(spacing: 6) {
+                StatChip(label: "Saved", value: s.done, color: .vsGreen)
+                StatChip(label: "Failed", value: s.failed, color: .vsRed)
+                StatChip(label: "Downloading", value: s.active, color: .vsIndigo)
+                StatChip(label: "Waiting", value: s.waiting - s.retrying, color: .secondary)
+                if s.retrying > 0 { StatChip(label: "Retrying", value: s.retrying, color: .vsAmber) }
+                Spacer()
+            }
+
+            // Running downloads, each with its own bar and speed.
+            let running = dl.tasks.filter { $0.state == .downloading }
+            if !running.isEmpty {
+                ScrollView {
+                    VStack(spacing: 4) {
+                        ForEach(running) { t in
+                            HStack(spacing: 8) {
+                                Text(t.title)
+                                    .font(.system(size: 11))
+                                    .lineLimit(1).truncationMode(.tail)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                if t.attempts > 1 {
+                                    Text("retry \(t.attempts - 1)")
+                                        .font(.system(size: 9, weight: .bold))
+                                        .foregroundStyle(Color.vsAmber)
+                                }
+                                Text(formatSpeed(t.speed))
+                                    .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 74, alignment: .trailing)
+                                ProgressBar(value: t.progress, done: false, height: 6)
+                                    .frame(width: 140)
+                                Text("\(Int(t.progress * 100))%")
+                                    .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 32, alignment: .trailing)
+                            }
+                        }
+                    }
+                }
+                .frame(height: min(CGFloat(running.count), 4) * 20)
+            }
+
+            if finishedAll && s.finished > 0 {
+                ResultBanner(saved: s.done, failed: s.failed)
+            } else if dl.pausedForDisk {
+                Label(dl.status, systemImage: "externaldrive.fill.badge.exclamationmark")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .background(Capsule().fill(Color.vsRed))
+            }
+
+            HStack(spacing: 8) {
+                if s.active > 0 || s.waiting > 0 {
+                    if dl.paused {
+                        ActionButton(title: "Resume", icon: "play.fill", color: .vsGreen) { dl.resume() }
+                    } else {
+                        ActionButton(title: "Pause", icon: "pause.fill", color: .vsIndigo) { dl.pause() }
+                    }
+                    ActionButton(title: "Stop all", icon: "stop.fill", color: .vsRed) { dl.stopAll() }
+                }
+                if s.failed + s.cancelled > 0 {
+                    ActionButton(title: "Retry failed (\(s.failed + s.cancelled))",
+                                 icon: "arrow.clockwise", color: .vsAmber) { dl.retryFailed() }
+                }
+                Spacer()
+                if let f = dl.lastFolder {
+                    PillButton(title: "Show in Finder", icon: "folder", color: .vsGreen) {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: f))
+                    }
+                }
+                if s.finished + s.cancelled > 0 {
+                    PillButton(title: "Clear finished", icon: "trash", color: .secondary) { dl.clearFinished() }
+                }
+            }
+        }
     }
 
     // MARK: Link
@@ -128,13 +303,13 @@ struct ContentView: View {
     private var linkCard: some View {
         Card("Link", icon: "link", tint: .vsIndigo) {
             HStack(spacing: 8) {
-                TextField("Paste a YouTube link…", text: $dl.url)
+                TextField("Paste a YouTube video or playlist link…", text: $dl.url)
                     .textFieldStyle(.plain)
                     .font(.system(size: 14))
                     .padding(.horizontal, 12).padding(.vertical, 10)
                     .background(RoundedRectangle(cornerRadius: 10).fill(Color(nsColor: .textBackgroundColor)))
                     .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.vsIndigo.opacity(0.35), lineWidth: 1))
-                    .onSubmit(startDownload)
+                    .onSubmit(addToQueue)
                 PillButton(title: "Paste", icon: "doc.on.clipboard", color: .vsIndigo) {
                     if let s = NSPasteboard.general.string(forType: .string) {
                         dl.url = s.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -152,13 +327,15 @@ struct ContentView: View {
             if dl.fetching {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text("Checking available qualities…").font(.callout).foregroundStyle(.secondary)
+                    Text(dl.playlistMode && Downloader.hasPlaylist(trimmedURL)
+                         ? "Loading the playlist…" : "Checking available qualities…")
+                        .font(.callout).foregroundStyle(.secondary)
                 }
                 .padding(.top, 2)
             } else if let err = dl.infoError {
                 Label(err, systemImage: "exclamationmark.triangle.fill")
-                    .font(.callout)
-                    .foregroundStyle(Color.vsOrange)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(Color.vsAmber)
                     .lineLimit(3)
             } else if let info = dl.info {
                 preview(info)
@@ -189,9 +366,9 @@ struct ContentView: View {
                     if info.isPlaylist {
                         Tag(text: "Playlist" + (info.count.map { " · \($0) videos" } ?? ""), color: .vsViolet)
                     } else if let best = info.heights.first {
-                        Tag(text: "Up to \(qualityName(best))", color: .vsTeal)
+                        Tag(text: "Up to \(qualityName(best))", color: .vsGreen)
                     }
-                    if let d = info.duration { Tag(text: formatDuration(d), color: .vsOrange) }
+                    if let d = info.duration { Tag(text: formatDuration(d), color: .vsAmber) }
                 }
                 if let u = info.uploader {
                     Text(u).font(.caption).foregroundStyle(.secondary).lineLimit(1)
@@ -230,14 +407,11 @@ struct ContentView: View {
             }
             .toggleStyle(.switch)
             .tint(.vsViolet)
-            .disabled(dl.isRunning)
             .help("If the link is a playlist (or a video inside one), list every video so you can pick which to save")
             .padding(.top, 4)
             if dl.playlistMode && urlLooksValid && !Downloader.hasPlaylist(trimmedURL) {
-                Text("This link isn’t part of a playlist — only this video will be saved.")
+                Text("This link isn’t part of a playlist, so only this video will be saved.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
-            } else if dl.playlistMode && dl.fetching {
-                Text("Loading the playlist…").font(.system(size: 11)).foregroundStyle(.secondary)
             }
         }
     }
@@ -265,38 +439,6 @@ struct ContentView: View {
         }
     }
 
-    // MARK: Sign-in
-
-    private let browsers = ["Chrome", "Safari", "Firefox", "Brave", "Edge"]
-
-    private var signInCard: some View {
-        Card("YouTube sign-in", icon: "person.badge.key.fill", tint: .vsOrange) {
-            Text(dl.needsSignIn
-                 ? "YouTube is asking to confirm you’re not a bot. Pick the browser where you’re signed in to YouTube — the app borrows that sign-in (macOS may ask for permission once)."
-                 : "Only needed if YouTube says “confirm you’re not a bot”. Uses your browser’s YouTube sign-in.")
-                .font(.system(size: 12))
-                .foregroundStyle(dl.needsSignIn ? Color.vsOrange : Color.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    Chip(title: "Off", subtitle: nil, selected: cookiesBrowser.isEmpty) {
-                        cookiesBrowser = ""; dl.refetch()
-                    }
-                    ForEach(browsers, id: \.self) { b in
-                        Chip(title: b, subtitle: nil, selected: cookiesBrowser == b) {
-                            cookiesBrowser = b; dl.refetch()
-                        }
-                    }
-                }
-                .padding(.vertical, 2)
-            }
-        }
-        .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(Color.vsOrange, lineWidth: dl.needsSignIn ? 2 : 0)
-        )
-    }
-
     // MARK: Playlist
 
     private var playlistCard: some View {
@@ -309,24 +451,13 @@ struct ContentView: View {
                 PillButton(title: "Select all", icon: "checkmark.circle", color: .vsViolet) { dl.setAll(selected: true) }
                 PillButton(title: "Select none", icon: "circle", color: .vsViolet) { dl.setAll(selected: false) }
             }
-            .disabled(dl.isRunning)
-            Text(dl.isRunning ? "Downloading — selection is locked." : "Click a video to include or skip it.")
+            Text("Click a video to include or skip it. You can add more videos or other links while downloads run.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
-
-            HStack(spacing: 8) {
-                Image(systemName: "bolt.horizontal.fill").foregroundStyle(Color.vsOrange)
-                Text("Download at once").font(.system(size: 12, weight: .semibold))
-                ForEach([1, 2, 4, 6, 8], id: \.self) { n in
-                    Chip(title: "\(n)", subtitle: nil, selected: dl.parallel == n) { dl.parallel = n }
-                }
-                Spacer()
-            }
-            .help("How many videos download at the same time. 4 is a good balance; 8 is fastest but YouTube may ask for a sign-in check sooner.")
 
             ScrollView {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 220), spacing: 12)], spacing: 14) {
                     ForEach(dl.items) { item in
-                        PlaylistTile(item: item, locked: dl.isRunning) { dl.toggle(item) }
+                        PlaylistTile(item: item) { dl.toggle(item) }
                     }
                 }
                 .padding(4)
@@ -353,170 +484,136 @@ struct ContentView: View {
                 }
                 .help(folder)
                 Spacer()
-                PillButton(title: "Change", icon: "folder.badge.gearshape", color: .vsTeal, action: chooseFolder)
-                PillButton(title: "Open", icon: "arrow.up.forward.app", color: .vsTeal) {
+                PillButton(title: "Change", icon: "folder.badge.gearshape", color: .vsIndigo, action: chooseFolder)
+                PillButton(title: "Open", icon: "arrow.up.forward.app", color: .vsIndigo) {
                     NSWorkspace.shared.open(URL(fileURLWithPath: folder))
                 }
             }
+            if let free = dl.freeBytes, let total = dl.totalBytes, total > 0 {
+                DiskBar(free: free, total: total, low: dl.lowDisk, limitGB: dl.minFreeGB)
+            }
         }
     }
 
-    // MARK: Action + progress + details
+    // MARK: Add to queue
 
-    private var actionCard: some View {
-        Card(nil, icon: nil, tint: .clear) {
-            if dl.isRunning {
-                Button { dl.cancel() } label: {
-                    Label("Cancel", systemImage: "stop.circle.fill")
-                        .font(.system(size: 16, weight: .bold))
-                        .frame(maxWidth: .infinity).padding(.vertical, 13)
-                        .foregroundStyle(.white)
-                        .background(Capsule().fill(Color.red.opacity(0.85)))
-                }
-                .buttonStyle(.plain)
-            } else {
-                Button(action: startDownload) {
-                    Label(downloadLabel, systemImage: "arrow.down.circle.fill")
-                        .font(.system(size: 16, weight: .bold))
-                        .frame(maxWidth: .infinity).padding(.vertical, 13)
-                        .foregroundStyle(.white)
-                        .background(Capsule().fill(brandGradient))
-                        .shadow(color: Color.vsViolet.opacity(0.4), radius: 8, y: 4)
-                        .opacity(canDownload ? 1 : 0.45)
-                }
-                .buttonStyle(.plain)
-                .disabled(!canDownload)
-                .keyboardShortcut(.defaultAction)
-            }
-
-            if dl.isBatch && (dl.isRunning || dl.batchTotal > 0) {
-                VStack(alignment: .leading, spacing: 4) {
-                    if dl.isRunning && !dl.activeIndices.isEmpty {
-                        Text("Downloading now (\(dl.activeIndices.count) at once)")
-                            .font(.system(size: 11, weight: .bold)).foregroundStyle(.secondary)
-                        ForEach(dl.activeIndices, id: \.self) { i in
-                            if i < dl.items.count {
-                                let item = dl.items[i]
-                                HStack(spacing: 8) {
-                                    Text("#\(item.index)")
-                                        .font(.system(size: 10, weight: .bold).monospacedDigit())
-                                        .foregroundStyle(Color.vsViolet)
-                                        .frame(width: 38, alignment: .leading)
-                                    Text(item.title)
-                                        .font(.system(size: 11))
-                                        .lineLimit(1).truncationMode(.tail)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                    ProgressBar(value: item.progress, done: false, height: 6)
-                                        .frame(width: 160)
-                                    Text("\(Int(item.progress * 100))%")
-                                        .font(.system(size: 10, weight: .semibold).monospacedDigit())
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 34, alignment: .trailing)
-                                }
-                            }
-                        }
-                    }
-
-                    HStack {
-                        Text(overallText)
-                        Spacer()
-                        if let eta = dl.etaText, dl.isRunning { Text(eta) }
-                        Text("\(Int(dl.overallProgress * 100))%").monospacedDigit()
-                    }
-                    .font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
-                    .padding(.top, 4)
-                    ProgressBar(value: dl.overallProgress, done: dl.lastExitOK, height: 12)
-                }
-                .padding(.top, 4)
-            } else {
-                ProgressBar(value: dl.progress, done: dl.lastExitOK, height: 10)
-                    .padding(.top, 4)
-            }
-
-            HStack(alignment: .top) {
-                if dl.lastExitOK && !dl.isRunning {
-                    Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.vsTeal)
-                }
-                Text(dl.status)
-                    .font(.system(size: 12).monospacedDigit())
-                    .foregroundStyle(statusColor)
-                    .lineLimit(2)
-                Spacer()
-                if dl.lastExitOK && !dl.isRunning {
-                    Button("Show in Finder") { NSWorkspace.shared.open(URL(fileURLWithPath: dl.outputFolder(default: folder))) }
-                        .buttonStyle(.link)
-                        .font(.system(size: 12, weight: .semibold))
-                }
-            }
-
-            Divider().padding(.vertical, 2)
-
-            Button { form.showLog.toggle() } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "chevron.right")
-                        .rotationEffect(.degrees(form.showLog ? 90 : 0))
-                        .animation(.easeInOut(duration: 0.15), value: form.showLog)
-                    Text(form.showLog ? "Hide details" : "Show details")
-                    Spacer()
-                }
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .contentShape(Rectangle())
+    private var addButton: some View {
+        VStack(spacing: 6) {
+            Button(action: addToQueue) {
+                Label(addLabel, systemImage: dl.isBusy ? "text.badge.plus" : "arrow.down.circle.fill")
+                    .font(.system(size: 16, weight: .bold))
+                    .frame(maxWidth: .infinity).padding(.vertical, 13)
+                    .foregroundStyle(.white)
+                    .background(Capsule().fill(brandGradient))
+                    .shadow(color: Color.vsViolet.opacity(0.4), radius: 8, y: 4)
+                    .opacity(canAdd ? 1 : 0.45)
             }
             .buttonStyle(.plain)
+            .disabled(!canAdd)
+            .keyboardShortcut(.defaultAction)
 
-            if form.showLog {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 0) {
-                            Text(dl.log.isEmpty ? "Nothing yet." : dl.log)
-                                .font(.system(size: 11, design: .monospaced))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(10)
-                            Color.clear.frame(height: 1).id("end")
-                        }
-                    }
-                    .frame(height: 150)                      // fixed: never takes over the window
-                    .background(RoundedRectangle(cornerRadius: 10).fill(Color(nsColor: .textBackgroundColor)))
-                    .onChange(of: dl.log) { _ in proxy.scrollTo("end", anchor: .bottom) }
-                    .onAppear { proxy.scrollTo("end", anchor: .bottom) }
-                }
+            if !dl.status.isEmpty && dl.status != "Ready" && !dl.pausedForDisk {
+                Text(dl.status)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .padding(.horizontal, 12).padding(.vertical, 5)
+                    .background(Capsule().fill(Color.black.opacity(0.28)))
             }
         }
     }
 
-    private var downloadLabel: String {
+    private var addLabel: String {
+        let what = mode == .audio ? "\(audioFormat)" : (dl.height.map(qualityName) ?? "best quality")
+        let verb = dl.isBusy || dl.paused ? "Add" : "Download"
         if playlistActive {
             let n = dl.selectedCount
-            let what = mode == .audio ? "as \(audioFormat)" : (dl.height.map(qualityName) ?? "best quality")
-            return n == 0 ? "Select videos to download" : "Download \(n) \(n == 1 ? "video" : "videos") · \(what)"
+            if n == 0 { return "Select videos to download" }
+            let noun = n == 1 ? "video" : "videos"
+            return dl.isBusy || dl.paused ? "Add \(n) \(noun) to queue · \(what)" : "Download \(n) \(noun) · \(what)"
         }
-        switch mode {
-        case .audio: return "Download \(audioFormat)"
-        case .video: return "Download " + (dl.height.map(qualityName) ?? "best quality")
+        return dl.isBusy || dl.paused ? "\(verb) to queue · \(what)" : "\(verb) · \(what)"
+    }
+
+    // MARK: Queue list
+
+    private var filteredTasks: [DownloadTask] {
+        switch form.queueFilter {
+        case .all: return dl.tasks
+        case .waiting: return dl.tasks.filter { $0.state == .waiting }
+        case .active: return dl.tasks.filter { $0.state == .downloading }
+        case .saved: return dl.tasks.filter { $0.state == .done }
+        case .failed: return dl.tasks.filter { $0.state == .failed || $0.state == .cancelled }
         }
     }
 
-    private var overallText: String {
-        var t = "Overall: \(dl.batchSaved) of \(dl.batchTotal) saved"
-        if dl.batchFailed > 0 { t += " · \(dl.batchFailed) failed" }
-        if dl.isRunning { t += " · \(dl.activeIndices.count) in progress" }
-        return t
+    private var queueCard: some View {
+        Card("Queue", icon: "list.number", tint: .vsIndigo) {
+            HStack(spacing: 6) {
+                ForEach(QueueFilter.allCases) { f in
+                    Chip(title: f.rawValue, subtitle: nil, selected: form.queueFilter == f) { form.queueFilter = f }
+                }
+                Spacer()
+            }
+            let list = filteredTasks
+            if list.isEmpty {
+                Text("Nothing here.").font(.callout).foregroundStyle(.secondary).padding(.vertical, 6)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 6) {
+                        ForEach(list) { t in
+                            QueueRow(task: t, maxRetries: dl.maxRetries) { dl.remove(t.id) }
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+                .frame(height: min(CGFloat(list.count) * 50, 300))
+            }
+        }
     }
 
-    private var statusColor: Color {
-        if dl.status.hasPrefix("ERROR") || dl.status.hasPrefix("Failed") { return .red }
-        if dl.lastExitOK { return .vsTeal }
-        return .secondary
+    // MARK: Activity log (saved + failed only)
+
+    private var logCard: some View {
+        let saved = dl.entries.filter(\.ok).count
+        let failed = dl.entries.count - saved
+        let shown = dl.entries.reversed().filter { form.logFilter == 0 || (form.logFilter == 1) == $0.ok }
+        return Card("Activity log", icon: "doc.text.magnifyingglass", tint: .vsGreen) {
+            HStack(spacing: 6) {
+                Chip(title: "All \(dl.entries.count)", subtitle: nil, selected: form.logFilter == 0) { form.logFilter = 0 }
+                Chip(title: "Saved \(saved)", subtitle: nil, selected: form.logFilter == 1) { form.logFilter = 1 }
+                Chip(title: "Failed \(failed)", subtitle: nil, selected: form.logFilter == 2) { form.logFilter = 2 }
+                Spacer()
+                PillButton(title: "Copy", icon: "doc.on.doc", color: .vsIndigo) { copyLog() }
+                PillButton(title: "Clear", icon: "trash", color: .secondary) { dl.clearLog() }
+            }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 4) {
+                    ForEach(shown) { e in LogRow(entry: e) }
+                }
+                .padding(8)
+            }
+            .frame(height: min(CGFloat(shown.count) * 30 + 16, 220))
+            .background(RoundedRectangle(cornerRadius: 10).fill(Color(nsColor: .textBackgroundColor)))
+        }
+    }
+
+    private func copyLog() {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let text = dl.entries.map { e in
+            "\(df.string(from: e.date))  \(e.ok ? "SAVED " : "FAILED")  \(e.title)" + (e.detail.map { "  (\($0))" } ?? "")
+        }.joined(separator: "\n")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     // MARK: Actions & helpers
 
-    private func startDownload() {
-        guard canDownload else { return }
+    private func addToQueue() {
+        guard canAdd else { return }
         try? FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
-        dl.download(folder: folder, mode: mode, height: dl.height, audioFormat: audioFormat)
+        dl.enqueueCurrent(folder: folder, mode: mode, height: dl.height, audioFormat: audioFormat)
     }
 
     private func chooseFolder() {
@@ -532,6 +629,292 @@ struct ContentView: View {
 
     private func displayPath(_ p: String) -> String {
         p.replacingOccurrences(of: NSHomeDirectory(), with: "~")
+    }
+}
+
+// MARK: - Settings
+
+struct SettingsView: View {
+    @ObservedObject var dl: Downloader
+    let close: () -> Void
+    @AppStorage("cookiesBrowser") private var cookiesBrowser = ""
+    private let browsers = ["Chrome", "Safari", "Firefox", "Brave", "Edge"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack {
+                Label("Settings", systemImage: "gearshape.fill")
+                    .font(.system(size: 18, weight: .heavy))
+                Spacer()
+                Text("Video Saver v\(appVersion)").font(.caption).foregroundStyle(.secondary)
+            }
+
+            setting("Retry failed downloads",
+                    "If a download fails, try it again automatically this many times (waiting a few seconds longer each time).") {
+                ForEach([0, 1, 2, 3, 5], id: \.self) { n in
+                    Chip(title: n == 0 ? "Off" : "\(n)", subtitle: nil, selected: dl.maxRetries == n, compact: true) { dl.maxRetries = n }
+                }
+            }
+
+            setting("Download at once",
+                    "How many files download at the same time. 4 is a good balance; 8 is fastest, but YouTube may ask for a sign-in check sooner.") {
+                ForEach([1, 2, 4, 6, 8], id: \.self) { n in
+                    Chip(title: "\(n)", subtitle: nil, selected: dl.parallel == n, compact: true) { dl.parallel = n }
+                }
+            }
+
+            setting("Pause when free space is low",
+                    "The queue pauses by itself when the disk you save to has less free space than this, and carries on when space is freed.") {
+                ForEach([0, 1, 2, 5, 10, 20], id: \.self) { n in
+                    Chip(title: n == 0 ? "Never" : "\(n) GB", subtitle: nil, selected: dl.minFreeGB == n, compact: true) { dl.minFreeGB = n }
+                }
+            }
+
+            setting("YouTube sign-in",
+                    "Only needed if YouTube says “confirm you’re not a bot”. The app borrows your browser’s YouTube sign-in (macOS may ask permission once).") {
+                Chip(title: "Off", subtitle: nil, selected: cookiesBrowser.isEmpty, compact: true) { cookiesBrowser = ""; dl.refetch() }
+                ForEach(browsers, id: \.self) { b in
+                    Chip(title: b, subtitle: nil, selected: cookiesBrowser == b, compact: true) { cookiesBrowser = b; dl.refetch() }
+                }
+            }
+
+            HStack {
+                Spacer()
+                Button("Done", action: close)
+                    .keyboardShortcut(.defaultAction)
+                    .controlSize(.large)
+            }
+        }
+        .padding(24)
+        .frame(width: 600)
+    }
+
+    private func setting<C: View>(_ title: String, _ help: String, @ViewBuilder _ chips: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.system(size: 14, weight: .bold))
+            Text(help).font(.system(size: 12)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) { chips() }
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+// MARK: - Small components for v2
+
+struct HeaderButton: View {
+    let title: String
+    let icon: String
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 11).padding(.vertical, 7)
+                .background(Capsule().fill(Color.white.opacity(0.18)))
+                .overlay(Capsule().stroke(Color.white.opacity(0.35), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct DiskPill: View {
+    let free: Int64?
+    let total: Int64?
+    let low: Bool
+    let limitGB: Int
+    var body: some View {
+        if let free {
+            Label(formatDisk(free) + " free", systemImage: low ? "externaldrive.fill.badge.exclamationmark" : "internaldrive.fill")
+                .font(.system(size: 12, weight: .bold).monospacedDigit())
+                .foregroundStyle(.white)
+                .padding(.horizontal, 11).padding(.vertical, 7)
+                .background(Capsule().fill(low ? Color.vsRed : Color.black.opacity(0.22)))
+                .help(total.map { "Free space on the disk you save to: \(formatDisk(free)) of \(formatDisk($0))" } ?? "")
+        }
+    }
+}
+
+struct DiskBar: View {
+    let free: Int64
+    let total: Int64
+    let low: Bool
+    let limitGB: Int
+    var body: some View {
+        let used = Double(total - free) / Double(total)
+        VStack(alignment: .leading, spacing: 4) {
+            GeometryReader { g in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.08))
+                    Capsule().fill(low ? Color.vsRed : (used > 0.9 ? Color.vsAmber : Color.vsIndigo))
+                        .frame(width: g.size.width * min(max(used, 0), 1))
+                }
+            }
+            .frame(height: 6)
+            HStack {
+                Text("\(formatDisk(free)) free of \(formatDisk(total))")
+                    .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(low ? Color.vsRed : Color.secondary)
+                Spacer()
+                Text(limitGB > 0 ? "Queue pauses below \(limitGB) GB" : "Low-space pause is off")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.top, 2)
+    }
+}
+
+struct StatChip: View {
+    let label: String
+    let value: Int
+    let color: Color
+    var body: some View {
+        HStack(spacing: 4) {
+            Text("\(value)").font(.system(size: 12, weight: .heavy).monospacedDigit())
+            Text(label).font(.system(size: 11, weight: .semibold))
+        }
+        .foregroundStyle(value > 0 ? Color.white : Color.secondary)
+        .padding(.horizontal, 9).padding(.vertical, 4)
+        .background(Capsule().fill(value > 0 ? AnyShapeStyle(color) : AnyShapeStyle(Color.primary.opacity(0.06))))
+    }
+}
+
+struct ActionButton: View {
+    let title: String
+    let icon: String
+    let color: Color
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 12).padding(.vertical, 7)
+                .background(Capsule().fill(color))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// Solid, high-contrast summary of a finished queue (white text on dark green / amber).
+struct ResultBanner: View {
+    let saved: Int
+    let failed: Int
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: failed == 0 ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+            Text(failed == 0
+                 ? "All \(saved) saved"
+                 : "Saved \(saved) · \(failed) failed. Press Retry failed to try them again.")
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: 13, weight: .bold))
+        .foregroundStyle(.white)
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(RoundedRectangle(cornerRadius: 10).fill(failed == 0 ? Color.vsGreen : Color.vsAmber))
+    }
+}
+
+struct QueueRow: View {
+    let task: DownloadTask
+    let maxRetries: Int
+    let remove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            AsyncImage(url: task.thumbnail) { img in
+                img.resizable().aspectRatio(contentMode: .fill)
+            } placeholder: {
+                Color.primary.opacity(0.08)
+            }
+            .frame(width: 64, height: 36)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(task.title).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(task.groupTitle).lineLimit(1)
+                    Text("·")
+                    Text(task.kindLabel)
+                    if task.state == .failed, let e = task.lastError {
+                        Text("·")
+                        Text(e).foregroundStyle(Color.vsRed).lineLimit(1)
+                    }
+                }
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                if task.state == .downloading {
+                    ProgressBar(value: task.progress, done: false, height: 4)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            badge
+            if task.state == .waiting {
+                Button(action: remove) {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Remove from queue")
+            }
+        }
+        .padding(.horizontal, 8).padding(.vertical, 5)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+        .help(task.lastError ?? task.title)
+    }
+
+    @ViewBuilder private var badge: some View {
+        switch task.state {
+        case .waiting:
+            if task.attempts > 0 {
+                pill("Retry \(task.attempts) of \(maxRetries)", .vsAmber)
+            } else {
+                pill("Waiting", .gray)
+            }
+        case .downloading:
+            pill("\(Int(task.progress * 100))% · \(formatSpeed(task.speed))", .vsIndigo)
+        case .done: pill("Saved", .vsGreen)
+        case .failed: pill("Failed", .vsRed)
+        case .cancelled: pill("Stopped", .gray)
+        }
+    }
+
+    private func pill(_ text: String, _ color: Color) -> some View {
+        Text(text)
+            .font(.system(size: 10, weight: .bold).monospacedDigit())
+            .foregroundStyle(.white)
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .background(Capsule().fill(color))
+    }
+}
+
+struct LogRow: View {
+    let entry: LogEntry
+    private static let time: DateFormatter = {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        return f
+    }()
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: entry.ok ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                .foregroundStyle(entry.ok ? Color.vsGreen : Color.vsRed)
+            Text(Self.time.string(from: entry.date))
+                .font(.system(size: 11).monospacedDigit())
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(entry.title).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                if let d = entry.detail {
+                    Text(d).font(.system(size: 10))
+                        .foregroundStyle(entry.ok ? Color.secondary : Color.vsRed)
+                        .lineLimit(2)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .textSelection(.enabled)
     }
 }
 
@@ -604,6 +987,7 @@ struct Chip: View {
     let title: String
     let subtitle: String?
     let selected: Bool
+    var compact = false
     let action: () -> Void
 
     var body: some View {
@@ -614,8 +998,8 @@ struct Chip: View {
                     Text(subtitle).font(.system(size: 10, weight: .medium)).opacity(0.75)
                 }
             }
-            .frame(minWidth: 72)
-            .padding(.horizontal, 12).padding(.vertical, 8)
+            .frame(minWidth: compact ? 40 : 72)
+            .padding(.horizontal, compact ? 10 : 12).padding(.vertical, compact ? 6 : 8)
             .foregroundStyle(selected ? Color.white : Color.primary)
             .background(
                 RoundedRectangle(cornerRadius: 11, style: .continuous)
@@ -714,7 +1098,7 @@ struct ProgressBar: View {
         GeometryReader { g in
             ZStack(alignment: .leading) {
                 Capsule().fill(Color.primary.opacity(0.08))
-                Capsule().fill(done ? AnyShapeStyle(Color.vsTeal) : AnyShapeStyle(brandGradient))
+                Capsule().fill(done ? AnyShapeStyle(Color.vsGreen) : AnyShapeStyle(brandGradient))
                     .frame(width: max(0, g.size.width * min(max(value, 0), 1)))
                     .animation(.easeOut(duration: 0.25), value: value)
             }
@@ -725,7 +1109,6 @@ struct ProgressBar: View {
 
 struct PlaylistTile: View {
     let item: PlaylistItem
-    let locked: Bool
     let action: () -> Void
 
     var body: some View {
@@ -793,7 +1176,7 @@ struct PlaylistTile: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(locked ? item.title : (item.selected ? "Click to skip" : "Click to include"))
+        .help(item.selected ? "Click to skip" : "Click to include")
     }
 
     private var selectionBadge: some View {
@@ -809,13 +1192,19 @@ struct PlaylistTile: View {
             Label("Saved", systemImage: "checkmark.circle.fill")
                 .font(.system(size: 10, weight: .bold))
                 .padding(.horizontal, 6).padding(.vertical, 2)
-                .background(Capsule().fill(Color.vsTeal))
+                .background(Capsule().fill(Color.vsGreen))
+                .foregroundStyle(.white)
+        case .queued:
+            Label("Queued", systemImage: "clock.fill")
+                .font(.system(size: 10, weight: .bold))
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(Capsule().fill(Color.black.opacity(0.65)))
                 .foregroundStyle(.white)
         case .failed:
             Label("Failed", systemImage: "exclamationmark.triangle.fill")
                 .font(.system(size: 10, weight: .bold))
                 .padding(.horizontal, 6).padding(.vertical, 2)
-                .background(Capsule().fill(Color.red))
+                .background(Capsule().fill(Color.vsRed))
                 .foregroundStyle(.white)
         case .downloading:
             Text("\(Int(item.progress * 100))%")

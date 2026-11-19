@@ -7,7 +7,7 @@ enum Mode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-enum ItemState { case pending, downloading, done, failed, skipped }
+enum ItemState { case pending, queued, downloading, done, failed, skipped }
 
 /// One video inside a playlist.
 struct PlaylistItem: Identifiable {
@@ -36,32 +36,91 @@ struct VideoInfo {
     var entries: [PlaylistItem] = []
 }
 
-/// Runs yt-dlp as a child process and publishes progress for the UI.
-final class Downloader: ObservableObject {
-    // Download state
-    @Published var progress: Double = 0          // current item, 0...1
-    @Published var status = "Ready"
-    @Published var log = ""
-    @Published var isRunning = false
-    @Published var lastExitOK = false
+enum TaskState: Equatable { case waiting, downloading, done, failed, cancelled }
 
-    // Batch (playlist) state
-    @Published var items: [PlaylistItem] = []
+/// One file in the download queue (a single video, or one item of a playlist).
+struct DownloadTask: Identifiable {
+    let id = UUID()
+    let groupTitle: String       // playlist name, or "Single video"
+    let title: String
+    let url: String
+    let thumbnail: URL?
+    let folder: String
+    let template: String         // yt-dlp -o output template
+    let formatArgs: [String]     // quality / audio options chosen when it was queued
+    let kindLabel: String        // e.g. "MP3" or "1080p"
+    let sourceLink: String       // the link it was added from (to light up playlist tiles)
+    let rowID: String?           // playlist tile id, if any
+    var state: TaskState = .waiting
+    var progress: Double = 0
+    var speed: Double = 0        // bytes per second while downloading
+    var attempts = 0             // runs started so far
+    var retryAt: Date? = nil
+    var lastError: String? = nil
+
+    var dedupeKey: String { url + "|" + folder + "|" + formatArgs.joined(separator: " ") }
+}
+
+/// Only finished outcomes go in the activity log.
+struct LogEntry: Identifiable {
+    let id = UUID()
+    let date: Date
+    let ok: Bool
+    let title: String
+    let detail: String?
+}
+
+struct QueueStats: Equatable {
+    var waiting = 0, retrying = 0, active = 0, done = 0, failed = 0, cancelled = 0
+    var total: Int { waiting + active + done + failed }
+    var finished: Int { done + failed }
+}
+
+/// Runs yt-dlp as child processes: inspects links and works through a download queue.
+final class Downloader: ObservableObject {
+    static let shared = Downloader()
+
+    // MARK: Queue state
+    @Published var tasks: [DownloadTask] = []
+    @Published var stats = QueueStats()
+    @Published var paused = false
+    @Published var pausedForDisk = false
+    @Published var totalSpeed: Double = 0        // bytes/s across all running downloads
     @Published var overallProgress: Double = 0
-    @Published var currentTitle: String?
-    @Published var batchPosition = 0             // 1-based item being downloaded
-    @Published var batchTotal = 0
-    @Published var batchSaved = 0
-    @Published var batchFailed = 0
-    @Published var isBatch = false
-    @Published var activeIndices: [Int] = []     // playlist items downloading right now
     @Published var etaText: String?
-    /// How many playlist items download at the same time (1…8).
+    @Published var status = "Ready"
+    @Published var entries: [LogEntry] = []
+    @Published var lastFolder: String?
+    @Published var updatingEngine = false
+
+    // MARK: Settings (persisted)
+    /// How many files download at the same time (1…8).
     @Published var parallel: Int {
-        didSet { UserDefaults.standard.set(parallel, forKey: "parallel"); pumpQueue() }
+        didSet { UserDefaults.standard.set(parallel, forKey: "parallel"); pump() }
+    }
+    /// How many times a failed download is retried automatically.
+    @Published var maxRetries: Int {
+        didSet { UserDefaults.standard.set(maxRetries, forKey: "retries") }
+    }
+    /// Pause the queue when free space drops below this many GB (0 = never).
+    @Published var minFreeGB: Int {
+        didSet { UserDefaults.standard.set(minFreeGB, forKey: "minFreeGB"); refreshDisk() }
     }
 
-    // Link + selection (owned here so the view never re-triggers lookups when it redraws)
+    // MARK: Disk space
+    @Published var freeBytes: Int64?
+    @Published var totalBytes: Int64?
+    /// Folder whose volume we watch (the "Save to" folder).
+    var diskFolder: String = NSHomeDirectory() {
+        didSet { if diskFolder != oldValue { refreshDisk() } }
+    }
+    var lowDisk: Bool {
+        guard minFreeGB > 0, let f = freeBytes else { return false }
+        return f < Int64(minFreeGB) * 1_000_000_000
+    }
+
+    // MARK: Link + selection
+    @Published var items: [PlaylistItem] = []
     @Published var url = ""
     @Published var height: Int? = nil            // nil = best available
     @Published var playlistMode: Bool {
@@ -81,15 +140,26 @@ final class Downloader: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
 
     init() {
-        playlistMode = UserDefaults.standard.bool(forKey: "playlist")
-        let savedParallel = UserDefaults.standard.integer(forKey: "parallel")
+        let d = UserDefaults.standard
+        playlistMode = d.bool(forKey: "playlist")
+        let savedParallel = d.integer(forKey: "parallel")
         parallel = (1...8).contains(savedParallel) ? savedParallel : 4
+        maxRetries = d.object(forKey: "retries") == nil ? 3 : max(0, min(10, d.integer(forKey: "retries")))
+        minFreeGB = d.object(forKey: "minFreeGB") == nil ? 2 : max(0, d.integer(forKey: "minFreeGB"))
+
         $url
             .debounce(for: .milliseconds(500), scheduler: RunLoop.main)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .removeDuplicates()
             .sink { [weak self] link in self?.linkChanged(link) }
             .store(in: &cancellables)
+
+        // Free space is checked every 5 seconds.
+        Timer.publish(every: 5, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in self?.refreshDisk() }
+            .store(in: &cancellables)
+        refreshDisk()
     }
 
     static func isLink(_ s: String) -> Bool { s.hasPrefix("http://") || s.hasPrefix("https://") }
@@ -97,6 +167,8 @@ final class Downloader: ObservableObject {
 
     var selectedCount: Int { items.filter(\.selected).count }
     var showingPlaylist: Bool { info?.isPlaylist == true && !items.isEmpty }
+    /// Something is downloading, or waiting to download and not paused.
+    var isBusy: Bool { stats.active > 0 || (!paused && stats.waiting > 0) }
 
     private func linkChanged(_ link: String) {
         if Self.isLink(link) { fetchInfo(url: link) } else { clearInfo() }
@@ -109,12 +181,11 @@ final class Downloader: ObservableObject {
     }
 
     func setAll(selected: Bool) {
-        guard !isRunning else { return }
         for i in items.indices { items[i].selected = selected }
     }
 
     func toggle(_ item: PlaylistItem) {
-        guard !isRunning, let i = items.firstIndex(where: { $0.id == item.id }) else { return }
+        guard let i = items.firstIndex(where: { $0.id == item.id }) else { return }
         items[i].selected.toggle()
     }
 
@@ -130,11 +201,10 @@ final class Downloader: ObservableObject {
 
     private var infoProcess: Process?
     private var infoToken = 0
-    private var cancelled = false
-    private var logLines: [String] = []
 
     static let searchPaths = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
     static let percentRegex = try! NSRegularExpression(pattern: #"(\d{1,3}(?:\.\d+)?)%"#)
+    static let speedRegex = try! NSRegularExpression(pattern: #"at\s+~?\s*([\d.]+)\s*([KMGT]?i?B)/s"#)
 
     /// Looks for a tool bundled inside the app first, then in the usual Homebrew locations.
     static func find(_ tool: String) -> String? {
@@ -166,7 +236,7 @@ final class Downloader: ObservableObject {
         infoProcess = nil
         infoURL = nil
         info = nil
-        if !isRunning { items = [] }
+        items = []
         infoError = nil
         needsSignIn = false
         fetching = false
@@ -174,7 +244,6 @@ final class Downloader: ObservableObject {
 
     func fetchInfo(url: String, force: Bool = false) {
         if !force, url == infoURL { return }      // already looked up (or looking up) this link
-        guard !isRunning else { return }          // don't swap the list out mid-download
         clearInfo()
         infoURL = url
         guard let ytdlp = Self.find("yt-dlp") else {
@@ -224,6 +293,7 @@ final class Downloader: ObservableObject {
                 if let parsed {
                     self.info = parsed
                     self.items = parsed.entries
+                    self.syncTilesFromQueue()
                     self.height = parsed.isPlaylist ? nil : parsed.heights.first   // auto-select highest
                     if parsed.isPlaylist && !self.playlistMode {
                         self.suppressRefetch = true
@@ -332,64 +402,54 @@ final class Downloader: ObservableObject {
                          heights: heights.sorted(by: >), sizes: sizes, isPlaylist: false, count: nil)
     }
 
-    // MARK: - Download
+    // MARK: - Disk space
+
+    /// Reads free/total space of the save folder's disk (no side effects).
+    private func readDisk() {
+        var url = URL(fileURLWithPath: diskFolder)
+        // Walk up to the nearest folder that exists (the save folder may not be created yet).
+        while !FileManager.default.fileExists(atPath: url.path) && url.path != "/" {
+            url.deleteLastPathComponent()
+        }
+        let keys: Set<URLResourceKey> = [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey]
+        guard let v = try? url.resourceValues(forKeys: keys) else { return }
+        if let free = v.volumeAvailableCapacityForImportantUsage, freeBytes != free { freeBytes = free }
+        if let total = v.volumeTotalCapacity.map({ Int64($0) }), totalBytes != total { totalBytes = total }
+    }
+
+    /// Reads disk space, pausing the queue when it runs low and resuming when space comes back.
+    func refreshDisk() {
+        readDisk()
+        if lowDisk && stats.waiting > 0 && !paused {
+            paused = true
+            pausedForDisk = true
+            status = "Paused: less than \(minFreeGB) GB free. Free up space, then press Resume."
+            updateStats()
+        } else if pausedForDisk && !lowDisk {
+            // Space came back (or the limit was lowered): carry on by itself.
+            resume()
+        }
+    }
+
+    // MARK: - Queue
 
     private func formatArgs(mode: Mode, height: Int?, audioFormat: String) -> [String] {
-        var args = ["--newline", "--no-mtime", "--restrict-filenames", "--no-playlist",
-                    "--concurrent-fragments", "4"] + cookieArgs
-        if let ff = Self.find("ffmpeg") { args += ["--ffmpeg-location", ff] }
         switch mode {
         case .video:
             let h = height.map { "[height<=\($0)]" } ?? ""
             // At the chosen height, prefer H.264 + AAC (plays on every Mac/iPhone), else best available.
-            args += ["-f", "bv*\(h)+ba/b\(h)/b",
-                     "-S", "res,vcodec:h264,acodec:aac,ext",
-                     "--merge-output-format", "mp4",
-                     "--embed-metadata"]
+            return ["-f", "bv*\(h)+ba/b\(h)/b",
+                    "-S", "res,vcodec:h264,acodec:aac,ext",
+                    "--merge-output-format", "mp4",
+                    "--embed-metadata"]
         case .audio:
             let fmt = audioFormat.lowercased()
-            // Audio only needs the audio stream — much faster than pulling video and stripping it.
-            args += ["-f", "ba/b", "-x", "--audio-format", fmt, "--audio-quality", "0", "--embed-metadata"]
-            if fmt == "mp3" || fmt == "m4a" { args += ["--embed-thumbnail"] }
-        }
-        return args
-    }
-
-    /// Downloads the current link: the selected playlist items, or the single video.
-    func download(folder: String, mode: Mode, height: Int?, audioFormat: String) {
-        guard !isRunning else { return }
-        guard let ytdlp = Self.find("yt-dlp") else {
-            status = "yt-dlp not found — run:  brew install yt-dlp ffmpeg"
-            return
-        }
-        let link = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        let base = formatArgs(mode: mode, height: height, audioFormat: audioFormat)
-        resetRun()
-
-        if playlistMode && showingPlaylist {
-            startBatch(ytdlp: ytdlp, folder: folder, baseArgs: base)
-        } else {
-            isBatch = false
-            isRunning = true
-            status = "Starting download…"
-            let args = base + ["-P", folder, "-o", "%(title)s [%(id)s].%(ext)s", link]
-            launch(ytdlp, args, item: nil) { [weak self] code in
-                guard let self else { return }
-                self.isRunning = false
-                self.lastExitOK = code == 0 && !self.cancelled
-                if self.cancelled { self.status = "Cancelled" }
-                else if code == 0 { self.status = "Download complete"; self.progress = 1; self.overallProgress = 1 }
-                else if !self.needsSignIn { self.status = "Failed (code \(code)) — see details. Try “Update engine”." }
-            }
+            // Audio only needs the audio stream: much faster than pulling video and stripping it.
+            var a = ["-f", "ba/b", "-x", "--audio-format", fmt, "--audio-quality", "0", "--embed-metadata"]
+            if fmt == "mp3" || fmt == "m4a" { a += ["--embed-thumbnail"] }
+            return a
         }
     }
-
-    // Playlist batch: a pool of up to `parallel` yt-dlp processes working through the queue.
-    private var queue: [Int] = []
-    private var batchArgs: [String] = []
-    private var batchFolder = ""
-    private var batchTool = ""
-    private var batchStart = Date()
 
     private static func safeFolderName(_ s: String) -> String {
         let bad = CharacterSet(charactersIn: "/:\\?%*|\"<>\n\r\t")
@@ -398,87 +458,288 @@ final class Downloader: ObservableObject {
         return cleaned.isEmpty ? "Playlist" : String(cleaned.prefix(80))
     }
 
-    private func startBatch(ytdlp: String, folder: String, baseArgs: [String]) {
-        let selected = items.indices.filter { items[$0].selected }
-        guard !selected.isEmpty else { status = "Select at least one video"; return }
-        for i in items.indices {
-            items[i].state = items[i].selected ? .pending : .skipped
-            items[i].progress = 0
+    /// Adds the current link (selected playlist videos, or the single video) to the queue.
+    /// Returns how many files were added.
+    @discardableResult
+    func enqueueCurrent(folder: String, mode: Mode, height: Int?, audioFormat: String) -> Int {
+        let link = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.isLink(link) else { return 0 }
+        let fArgs = formatArgs(mode: mode, height: height, audioFormat: audioFormat)
+        let kind = mode == .audio ? audioFormat : (height.map { "\($0)p" } ?? "Best")
+        let existing = Set(tasks.filter { $0.state == .waiting || $0.state == .downloading }.map(\.dedupeKey))
+        var new: [DownloadTask] = []
+
+        if playlistMode && showingPlaylist {
+            let name = info?.title ?? "Playlist"
+            let sub = (folder as NSString).appendingPathComponent(Self.safeFolderName(name))
+            for i in items.indices where items[i].selected {
+                let it = items[i]
+                let t = DownloadTask(groupTitle: name, title: it.title, url: it.url, thumbnail: it.thumbnail,
+                                     folder: sub,
+                                     template: String(format: "%03d", it.index) + " - %(title)s.%(ext)s",
+                                     formatArgs: fArgs, kindLabel: kind, sourceLink: infoURL ?? link, rowID: it.id)
+                if existing.contains(t.dedupeKey) { continue }
+                new.append(t)
+                items[i].state = .queued
+                items[i].progress = 0
+            }
+        } else {
+            let t = DownloadTask(groupTitle: "Single video", title: info?.title ?? link, url: link,
+                                 thumbnail: info?.thumbnail, folder: folder,
+                                 template: "%(title)s [%(id)s].%(ext)s",
+                                 formatArgs: fArgs, kindLabel: kind, sourceLink: link, rowID: nil)
+            if !existing.contains(t.dedupeKey) { new.append(t) }
         }
-        queue = selected
-        batchTotal = selected.count
-        batchSaved = 0
-        batchFailed = 0
-        batchPosition = 0
-        batchTool = ytdlp
-        batchArgs = baseArgs
-        batchStart = Date()
+
+        guard !new.isEmpty else {
+            status = "Already in the queue"
+            return 0
+        }
+        if !isBusy { queueStart = Date(); finishedSinceStart = 0 }
+        tasks.append(contentsOf: new)
+        status = new.count == 1 ? "Added “\(new[0].title)” to the queue"
+                                : "Added \(new.count) files to the queue"
+        updateStats()
+        pump()
+        return new.count
+    }
+
+    func pause() {
+        paused = true
+        pausedForDisk = false
+        status = "Paused. Downloads in progress will finish; nothing new starts."
+        updateStats()
+    }
+
+    func resume() {
+        readDisk()
+        if lowDisk && stats.waiting > 0 {
+            status = "Still less than \(minFreeGB) GB free. Free up space or lower the limit in Settings."
+            pausedForDisk = true
+            return
+        }
+        paused = false
+        pausedForDisk = false
+        if !isBusy || stats.active == 0 { queueStart = Date(); finishedSinceStart = 0 }
+        pump()
+    }
+
+    /// Stops everything: running downloads are interrupted and waiting ones cancelled.
+    func stopAll() {
+        for i in tasks.indices where tasks[i].state == .waiting {
+            tasks[i].state = .cancelled
+            syncTile(tasks[i])
+        }
+        for job in jobs.values {
+            guard let id = job.taskID else { continue }
+            stopping.insert(id)
+            let p = job.process
+            if p.isRunning {
+                p.interrupt()                              // SIGINT lets yt-dlp clean up
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { if p.isRunning { p.terminate() } }
+            }
+        }
+        status = "Stopped"
+        updateStats()
+    }
+
+    /// Puts every failed (and stopped) item back in the queue with a fresh retry count.
+    func retryFailed() {
+        var n = 0
+        for i in tasks.indices where tasks[i].state == .failed || tasks[i].state == .cancelled {
+            tasks[i].state = .waiting
+            tasks[i].attempts = 0
+            tasks[i].progress = 0
+            tasks[i].retryAt = nil
+            tasks[i].lastError = nil
+            syncTile(tasks[i])
+            n += 1
+        }
+        guard n > 0 else { return }
+        paused = false
+        if stats.active == 0 { queueStart = Date(); finishedSinceStart = 0 }
+        status = "Retrying \(n) \(n == 1 ? "file" : "files")"
+        updateStats()
+        pump()
+    }
+
+    /// Removes saved, failed and stopped items from the list.
+    func clearFinished() {
+        tasks.removeAll { $0.state == .done || $0.state == .failed || $0.state == .cancelled }
+        updateStats()
+    }
+
+    func remove(_ id: UUID) {
+        guard let i = tasks.firstIndex(where: { $0.id == id }), tasks[i].state == .waiting else { return }
+        tasks[i].state = .cancelled
+        syncTile(tasks[i])
+        tasks.remove(at: i)
+        updateStats()
+    }
+
+    func clearLog() { entries.removeAll() }
+
+    /// Called when the app quits: don't leave yt-dlp running in the background.
+    func terminateAll() {
+        for job in jobs.values where job.process.isRunning { job.process.terminate() }
+    }
+
+    // MARK: - Queue engine
+
+    private struct Job {
+        let process: Process
+        let taskID: UUID?
+    }
+    private final class LineBuffer { var text = "" }
+    private var jobs: [ObjectIdentifier: Job] = [:]
+    private var stopping = Set<UUID>()
+    private var queueStart = Date()
+    private var finishedSinceStart = 0
+    private var retryTimerPending = false
+    private var sleepActivity: NSObjectProtocol?
+
+    private func index(of id: UUID) -> Int? { tasks.firstIndex { $0.id == id } }
+
+    /// Starts waiting downloads until `parallel` are running.
+    func pump() {
+        guard !paused else { updateStats(); return }
+        if lowDisk && stats.waiting > 0 {
+            paused = true
+            pausedForDisk = true
+            status = "Paused: less than \(minFreeGB) GB free. Free up space, then press Resume."
+            updateStats()
+            return
+        }
+        guard let ytdlp = Self.find("yt-dlp") else {
+            status = "yt-dlp not found. Run:  brew install yt-dlp ffmpeg"
+            return
+        }
+        let now = Date()
+        var running = jobs.values.filter { $0.taskID != nil }.count
+        var nextRetry: Date?
+        for i in tasks.indices where running < parallel && tasks[i].state == .waiting {
+            if let at = tasks[i].retryAt, at > now {
+                nextRetry = min(nextRetry ?? at, at)
+                continue
+            }
+            start(i, ytdlp: ytdlp)
+            running += 1
+        }
+        // Wake up again when the earliest pending retry is due.
+        if let at = nextRetry, !retryTimerPending {
+            retryTimerPending = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + max(0.5, at.timeIntervalSinceNow)) { [weak self] in
+                self?.retryTimerPending = false
+                self?.pump()
+            }
+        }
+        updateStats()
+    }
+
+    private func start(_ i: Int, ytdlp: String) {
+        tasks[i].state = .downloading
+        tasks[i].attempts += 1
+        tasks[i].progress = 0
+        tasks[i].speed = 0
+        tasks[i].retryAt = nil
+        let t = tasks[i]
+        syncTile(t)
+        try? FileManager.default.createDirectory(atPath: t.folder, withIntermediateDirectories: true)
+
+        var args = ["--newline", "--no-mtime", "--restrict-filenames", "--no-playlist",
+                    "--concurrent-fragments", "4"] + cookieArgs
+        if let ff = Self.find("ffmpeg") { args += ["--ffmpeg-location", ff] }
+        args += t.formatArgs + ["-P", t.folder, "-o", t.template, t.url]
+
+        let id = t.id
+        launch(ytdlp, args, taskID: id) { [weak self] code in self?.finished(id, code: code) }
+    }
+
+    private func finished(_ id: UUID, code: Int32) {
+        let wasStopped = stopping.remove(id) != nil
+        guard let i = index(of: id) else { pump(); return }
+        tasks[i].speed = 0
+
+        if code == 0 && !wasStopped {
+            tasks[i].state = .done
+            tasks[i].progress = 1
+            finishedSinceStart += 1
+            lastFolder = tasks[i].folder
+            entries.append(LogEntry(date: Date(), ok: true, title: tasks[i].title,
+                                    detail: tasks[i].groupTitle == "Single video" ? nil : tasks[i].groupTitle))
+        } else if wasStopped {
+            tasks[i].state = .cancelled
+            tasks[i].progress = 0
+        } else if tasks[i].attempts <= maxRetries {
+            // Automatic retry, with a growing pause: 5 s, 10 s, 15 s…
+            tasks[i].state = .waiting
+            tasks[i].progress = 0
+            tasks[i].retryAt = Date().addingTimeInterval(Double(5 * tasks[i].attempts))
+        } else {
+            tasks[i].state = .failed
+            finishedSinceStart += 1
+            let tries = tasks[i].attempts
+            let reason = tasks[i].lastError ?? "yt-dlp exited with code \(code)"
+            entries.append(LogEntry(date: Date(), ok: false, title: tasks[i].title,
+                                    detail: reason + (tries > 1 ? " (tried \(tries) times)" : "")))
+        }
+        if entries.count > 5000 { entries.removeFirst(entries.count - 5000) }
+        syncTile(tasks[i])
+        pump()
+        if stats.active == 0 && stats.waiting == 0 { allDone() }
+    }
+
+    private func allDone() {
+        let s = stats
+        if s.failed == 0 && s.done > 0 {
+            status = "All \(s.done) saved"
+        } else if s.done + s.failed > 0 {
+            status = "Saved \(s.done) · \(s.failed) failed. Press Retry failed to try them again."
+        }
         etaText = nil
-        batchFolder = (folder as NSString).appendingPathComponent(Self.safeFolderName(info?.title ?? "Playlist"))
-        try? FileManager.default.createDirectory(atPath: batchFolder, withIntermediateDirectories: true)
-        isBatch = true
-        isRunning = true
-        status = "Starting \(min(parallel, batchTotal)) downloads at once…"
-        pumpQueue()
     }
 
-    /// Starts queued items until `parallel` are running.
-    private func pumpQueue() {
-        guard isBatch, isRunning, !cancelled else { return }
-        while activeIndices.count < parallel, !queue.isEmpty {
-            startItem(queue.removeFirst())
-        }
-    }
-
-    private func startItem(_ i: Int) {
-        activeIndices.append(i)
-        batchPosition += 1
-        items[i].state = .downloading
-        items[i].progress = 0
-        currentTitle = items[i].title
-        appendLog("── start #\(items[i].index): \(items[i].title)")
-
-        let name = String(format: "%03d", items[i].index) + " - %(title)s.%(ext)s"
-        let args = batchArgs + ["-P", batchFolder, "-o", name, items[i].url]
-        launch(batchTool, args, item: i) { [weak self] code in
-            guard let self else { return }
-            self.activeIndices.removeAll { $0 == i }
-            if code == 0 && !self.cancelled {
-                self.items[i].state = .done
-                self.items[i].progress = 1
-                self.batchSaved += 1
-            } else if self.cancelled {
-                self.items[i].state = .pending
-                self.items[i].progress = 0
-            } else {
-                self.items[i].state = .failed
-                self.batchFailed += 1
-                self.appendLog("✗ failed #\(self.items[i].index): \(self.items[i].title)")
-            }
-            self.updateOverall()
-            if self.activeIndices.isEmpty && (self.queue.isEmpty || self.cancelled) {
-                self.finishBatch()
-            } else {
-                self.pumpQueue()
+    private func updateStats() {
+        var s = QueueStats()
+        var partial = 0.0
+        var speed = 0.0
+        for t in tasks {
+            switch t.state {
+            case .waiting:
+                s.waiting += 1
+                if t.attempts > 0 { s.retrying += 1 }
+            case .downloading:
+                s.active += 1
+                partial += t.progress
+                speed += t.speed
+            case .done: s.done += 1
+            case .failed: s.failed += 1
+            case .cancelled: s.cancelled += 1
             }
         }
-    }
+        if stats != s { stats = s }
+        if abs(totalSpeed - speed) > 1 { totalSpeed = speed }
+        let total = Double(max(s.total, 1))
+        let overall = min((Double(s.finished) + partial) / total, 1)
+        if abs(overall - overallProgress) > 0.0005 || overall == 0 || overall == 1 { overallProgress = overall }
 
-    private func updateOverall() {
-        let finished = Double(batchSaved + batchFailed)
-        let partial = activeIndices.reduce(0.0) { $0 + items[$1].progress }
-        let total = Double(max(batchTotal, 1))
-        overallProgress = min((finished + partial) / total, 1)
-        progress = activeIndices.isEmpty ? (finished > 0 ? 1 : 0) : partial / Double(activeIndices.count)
-        currentTitle = activeIndices.first.map { items[$0].title }
-
-        let elapsed = Date().timeIntervalSince(batchStart)
-        if overallProgress > 0.01 && elapsed > 5 {
-            let remaining = elapsed / overallProgress * (1 - overallProgress)
-            etaText = "about " + Self.formatETA(remaining) + " left"
+        // ETA from how fast files have been finishing since the queue started.
+        let elapsed = Date().timeIntervalSince(queueStart)
+        let doneEquivalent = Double(finishedSinceStart) + partial
+        let remaining = Double(s.waiting + s.active) - partial
+        if s.active > 0, doneEquivalent > 0.05, elapsed > 5, remaining > 0 {
+            etaText = "about " + Self.formatETA(elapsed / doneEquivalent * remaining) + " left"
+        } else if s.active == 0 {
+            etaText = nil
         }
-        if isRunning {
-            status = "\(activeIndices.count) downloading at once · \(batchSaved + batchFailed) of \(batchTotal) done"
+
+        // Keep the Mac awake while the queue is working.
+        if isBusy && sleepActivity == nil {
+            sleepActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.idleSystemSleepDisabled, .userInitiated], reason: "Downloading videos")
+        } else if !isBusy, let a = sleepActivity {
+            ProcessInfo.processInfo.endActivity(a)
+            sleepActivity = nil
         }
     }
 
@@ -489,96 +750,57 @@ final class Downloader: ObservableObject {
         return "\(t / 3600) h \((t % 3600) / 60) min"
     }
 
-    private func finishBatch() {
-        guard isRunning else { return }
-        isRunning = false
-        activeIndices.removeAll()
-        currentTitle = nil
-        etaText = nil
-        let folderName = (batchFolder as NSString).lastPathComponent
-        let took = Self.formatETA(Date().timeIntervalSince(batchStart))
-        if cancelled {
-            status = "Cancelled — \(batchSaved) of \(batchTotal) saved"
-        } else if batchFailed == 0 {
-            status = "All \(batchSaved) saved to “\(folderName)” in \(took)"
-            progress = 1
-            overallProgress = 1
-        } else {
-            status = "Saved \(batchSaved), \(batchFailed) failed — see details"
+    /// Mirrors a queue item's state onto its playlist tile, if that playlist is on screen.
+    private func syncTile(_ t: DownloadTask) {
+        guard let row = t.rowID, t.sourceLink == infoURL,
+              let i = items.firstIndex(where: { $0.id == row }) else { return }
+        let st: ItemState
+        switch t.state {
+        case .waiting: st = .queued
+        case .downloading: st = .downloading
+        case .done: st = .done
+        case .failed: st = .failed
+        case .cancelled: st = .pending
         }
-        lastExitOK = !cancelled && batchSaved > 0
+        if items[i].state != st || abs(items[i].progress - t.progress) >= 0.01 {
+            items[i].state = st
+            items[i].progress = t.progress
+        }
     }
 
-    /// Folder the last download went into (playlist subfolder, or the chosen folder).
-    func outputFolder(default folder: String) -> String {
-        isBatch && !batchFolder.isEmpty ? batchFolder : folder
+    /// After a playlist is (re)loaded, show which of its videos are already queued or saved.
+    private func syncTilesFromQueue() {
+        for t in tasks where t.rowID != nil { syncTile(t) }
     }
 
-    /// Updates yt-dlp through Homebrew — YouTube changes often, so this fixes most failures.
+    /// Updates yt-dlp through Homebrew. YouTube changes often, so this fixes most failures.
     func updateYtDlp() {
-        guard !isRunning else { return }
+        guard !updatingEngine, stats.active == 0 else { return }
         guard let brew = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
                 .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-            status = "Homebrew not found — install it from brew.sh"
+            status = "Homebrew not found. Install it from brew.sh"
             return
         }
-        resetRun()
-        isBatch = false
-        isRunning = true
+        updatingEngine = true
         status = "Updating yt-dlp…"
-        launch(brew, ["upgrade", "yt-dlp"], item: nil) { [weak self] code in
+        launch(brew, ["upgrade", "yt-dlp"], taskID: nil) { [weak self] code in
             guard let self else { return }
-            self.isRunning = false
-            self.lastExitOK = code == 0
-            self.status = code == 0 ? "yt-dlp is up to date" : "Update failed — see details"
-            if code == 0 { self.progress = 1 }
-        }
-    }
-
-    func cancel() {
-        guard isRunning else { return }
-        cancelled = true
-        queue.removeAll()
-        status = "Stopping…"
-        for job in jobs.values where job.process.isRunning {
-            let p = job.process
-            p.interrupt()                                  // SIGINT lets yt-dlp clean up
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { if p.isRunning { p.terminate() } }
+            self.updatingEngine = false
+            self.status = code == 0 ? "yt-dlp is up to date" : "Update failed. Try in Terminal: brew upgrade yt-dlp"
         }
     }
 
     // MARK: - Process plumbing
 
-    /// One running yt-dlp process and its partial output line.
-    private final class Job {
-        let process: Process
-        let item: Int?
-        var buffer = ""
-        init(process: Process, item: Int?) { self.process = process; self.item = item }
-    }
-    private var jobs: [ObjectIdentifier: Job] = [:]
-
-    private func resetRun() {
-        cancelled = false
-        lastExitOK = false
-        needsSignIn = false
-        progress = 0
-        overallProgress = 0
-        activeIndices.removeAll()
-        etaText = nil
-        logLines.removeAll()
-        log = ""
-    }
-
-    private func launch(_ executable: String, _ arguments: [String], item: Int?,
+    private func launch(_ executable: String, _ arguments: [String], taskID: UUID?,
                         onExit: @escaping (Int32) -> Void) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: executable)
         p.arguments = arguments
         p.environment = Self.environment()
         p.standardInput = FileHandle.nullDevice
-        let job = Job(process: p, item: item)
-        let key = ObjectIdentifier(job)
+        let key = ObjectIdentifier(p)
+        let buffer = LineBuffer()
 
         let pipe = Pipe()
         p.standardOutput = pipe
@@ -586,7 +808,7 @@ final class Downloader: ObservableObject {
         pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
             let data = h.availableData
             guard !data.isEmpty, let s = String(data: data, encoding: .utf8) else { return }
-            DispatchQueue.main.async { self?.consume(s, job: job) }
+            DispatchQueue.main.async { self?.consume(s, buffer: buffer, taskID: taskID) }
         }
 
         p.terminationHandler = { [weak self] proc in
@@ -594,78 +816,93 @@ final class Downloader: ObservableObject {
             let code = proc.terminationStatus
             DispatchQueue.main.async {
                 guard let self else { return }
-                if !job.buffer.trimmingCharacters(in: .whitespaces).isEmpty { self.handle(job.buffer, job: job) }
-                job.buffer = ""
+                if !buffer.text.trimmingCharacters(in: .whitespaces).isEmpty {
+                    self.handle(buffer.text, taskID: taskID)
+                }
+                buffer.text = ""
                 self.jobs[key] = nil
                 onExit(code)
             }
         }
 
-        if item == nil {
-            appendLog("$ \(URL(fileURLWithPath: executable).lastPathComponent) \(arguments.joined(separator: " "))")
-        }
-        jobs[key] = job
+        jobs[key] = Job(process: p, taskID: taskID)
         do {
             try p.run()
         } catch {
             jobs[key] = nil
-            appendLog("Couldn't start: \(error.localizedDescription)")
+            if let id = taskID, let i = index(of: id) { tasks[i].lastError = "Couldn't start yt-dlp: \(error.localizedDescription)" }
             DispatchQueue.main.async { onExit(-1) }
         }
     }
 
-    private func consume(_ chunk: String, job: Job) {
-        job.buffer += chunk
-        let parts = job.buffer.components(separatedBy: CharacterSet(charactersIn: "\r\n"))
-        job.buffer = parts.last ?? ""
+    private func consume(_ chunk: String, buffer: LineBuffer, taskID: UUID?) {
+        buffer.text += chunk
+        let parts = buffer.text.components(separatedBy: CharacterSet(charactersIn: "\r\n"))
+        buffer.text = parts.last ?? ""
         for line in parts.dropLast() where !line.trimmingCharacters(in: .whitespaces).isEmpty {
-            handle(line, job: job)
+            handle(line, taskID: taskID)
         }
     }
 
-    private func handle(_ line: String, job: Job) {
+    private static func speedBytes(_ value: Double, _ unit: String) -> Double {
+        switch unit.uppercased().first {
+        case "K": return value * 1024
+        case "M": return value * 1024 * 1024
+        case "G": return value * 1024 * 1024 * 1024
+        case "T": return value * 1024 * 1024 * 1024 * 1024
+        default: return value
+        }
+    }
+
+    private func handle(_ line: String, taskID: UUID?) {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
-        let tag = job.item.map { "[#\(items[$0].index)] " } ?? ""
-        // Progress lines arrive many times a second: show them in the status line, not the log.
-        let isProgress = trimmed.hasPrefix("[download]") && trimmed.contains("% of")
-        if !isProgress { appendLog(tag + line) }
+        guard let id = taskID else {
+            // Engine update output: only surface errors.
+            if trimmed.hasPrefix("Error") || trimmed.hasPrefix("ERROR") { status = trimmed }
+            return
+        }
+        guard let i = index(of: id) else { return }
 
         if trimmed.hasPrefix("[download]") {
             let ns = trimmed as NSString
-            if let m = Self.percentRegex.firstMatch(in: trimmed, range: NSRange(location: 0, length: ns.length)),
+            let range = NSRange(location: 0, length: ns.length)
+            var changed = false
+            if let m = Self.percentRegex.firstMatch(in: trimmed, range: range),
                let v = Double(ns.substring(with: m.range(at: 1))) {
                 let value = min(v / 100, 1)
-                if let i = job.item {
-                    // Throttle: with many parallel jobs, only publish visible (≥1%) changes.
-                    if abs(value - items[i].progress) >= 0.01 || value >= 1 {
-                        items[i].progress = value
-                        updateOverall()
-                    }
-                } else {
-                    progress = value
-                    overallProgress = value
+                // Throttle: with many parallel jobs, only publish visible (≥1%) changes.
+                if abs(value - tasks[i].progress) >= 0.01 || value >= 1 {
+                    tasks[i].progress = value
+                    changed = true
                 }
             }
-            if job.item == nil {
-                status = trimmed.replacingOccurrences(of: "[download]", with: "")
-                    .trimmingCharacters(in: .whitespaces)
+            if let m = Self.speedRegex.firstMatch(in: trimmed, range: range),
+               let v = Double(ns.substring(with: m.range(at: 1))) {
+                let bps = Self.speedBytes(v, ns.substring(with: m.range(at: 2)))
+                if changed || abs(bps - tasks[i].speed) > tasks[i].speed * 0.2 {
+                    tasks[i].speed = bps
+                    changed = true
+                }
             }
-        } else if job.item == nil && (trimmed.hasPrefix("[Merger]") || trimmed.hasPrefix("[ExtractAudio]")
-                    || trimmed.hasPrefix("[VideoConvertor]")) {
-            status = trimmed.hasPrefix("[ExtractAudio]") ? "Converting to audio…" : "Finishing up with ffmpeg…"
+            if changed {
+                syncTile(tasks[i])
+                updateStats()
+            }
+        } else if trimmed.hasPrefix("[ExtractAudio]") || trimmed.hasPrefix("[Merger]")
+                    || trimmed.hasPrefix("[VideoConvertor]") || trimmed.hasPrefix("[EmbedThumbnail]") {
+            if tasks[i].speed != 0 {
+                tasks[i].speed = 0
+                updateStats()
+            }
         } else if trimmed.hasPrefix("ERROR") {
+            var msg = trimmed.replacingOccurrences(of: "ERROR: ", with: "")
+            // "[youtube] abc123: Video unavailable" -> "Video unavailable"
+            if msg.hasPrefix("["), let r = msg.range(of: ": ") { msg = String(msg[r.upperBound...]) }
+            tasks[i].lastError = String(msg.prefix(200))
             if Self.isBotCheck(trimmed) {
                 needsSignIn = true
-                status = "YouTube wants a sign-in check — choose your browser under “YouTube sign-in”."
-            } else if job.item == nil {
-                status = trimmed
+                tasks[i].lastError = "YouTube asked to confirm you’re not a bot. Choose your browser in Settings → YouTube sign-in."
             }
         }
-    }
-
-    private func appendLog(_ line: String) {
-        logLines.append(line)
-        if logLines.count > 400 { logLines.removeFirst(logLines.count - 400) }
-        log = logLines.joined(separator: "\n")
     }
 }
